@@ -8,7 +8,8 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 # Install Chromium and its OS-level dependencies first so the layer is cached.
-COPY requirements.txt /app/requirements.txt
+# (Build context is the repository root - see docker-compose.yml.)
+COPY collector/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt \
     && python -m playwright install --with-deps chromium \
     && rm -rf /var/lib/apt/lists/* /root/.cache/ms-playwright/ffmpeg-*

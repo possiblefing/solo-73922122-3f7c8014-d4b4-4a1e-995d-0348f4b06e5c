@@ -1,0 +1,27 @@
+# Slow-teardown profile: browser reclamation is artificially delayed
+# (BROWSER_CLOSE_DELAY_SECONDS) so the job's "finalizing" phase becomes
+# observable and interruptible.  The portal itself stays fast, so
+# collection finishes quickly and the whole teardown window is available
+# for the demos.
+#
+# Scenarios (see docs/DEMO.md, section 7):
+#   A. success is reported only after reclamation completes
+#   B. cancellation is still accepted during finalization
+#       docker compose -f docker-compose.yml -f docker-compose.slowclose.yml up --build
+#       SLOWCLOSE=1 python -I tests/e2e_demo.py
+#   C. the 60s acceptance deadline expires during finalization
+#       JOB_TIMEOUT_SECONDS=14 docker compose -f docker-compose.yml -f docker-compose.slowclose.yml up --build
+#       SLOWCLOSE_TIMEOUT=1 python -I tests/e2e_demo.py
+services:
+  collector:
+    environment:
+      # Artificial slow reclamation of the browsing session (popup windows
+      # and downloads are reclaimed first, then this delay elapses before
+      # the context/browser process/driver are released).
+      BROWSER_CLOSE_DELAY_SECONDS: "${BROWSER_CLOSE_DELAY_SECONDS:-15}"
+      # Hard stop for teardown must stay comfortably above the delay so
+      # the reclamation always runs to completion.
+      CLEANUP_TIMEOUT_SECONDS: "${CLEANUP_TIMEOUT_SECONDS:-45}"
+      # Scenario C: shrink the acceptance budget so it expires while the
+      # job is finalizing (collection takes ~7s, teardown ~15s+).
+      JOB_TIMEOUT_SECONDS: "${JOB_TIMEOUT_SECONDS:-60}"

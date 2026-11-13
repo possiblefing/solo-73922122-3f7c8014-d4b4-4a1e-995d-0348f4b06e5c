@@ -66,7 +66,12 @@ class Deadline:
 
 
 class BrowserSession:
-    """Owns every browser-side resource of a single job."""
+    """Owns every browser-side resource of a single job.
+
+    `close()` is idempotent and *join-able*: concurrent callers wait for
+    the same in-progress reclamation instead of returning early or tearing
+    resources down twice.
+    """
 
     def __init__(self, settings: Settings, cancel_event: asyncio.Event,
                  deadline: Deadline, staging_dir: Path):
@@ -81,6 +86,7 @@ class BrowserSession:
         self._spawned_pages: list[Page] = []
         self._download_event = asyncio.Event()
         self._download: Download | None = None
+        self._close_lock = asyncio.Lock()
         self._closed = False
 
     async def __aenter__(self) -> "BrowserSession":
@@ -91,36 +97,43 @@ class BrowserSession:
         await self.close()
 
     async def start(self) -> None:
-        self._playwright = await async_playwright().start()
-        # A dedicated browser process per job: full process-level isolation
-        # between parallel jobs in addition to context-level isolation.
-        self._browser = await self._playwright.chromium.launch(
-            headless=self._settings.headless,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-background-networking",
-            ],
-        )
-        self._context = await self._browser.new_context(
-            accept_downloads=True,
-            viewport={"width": 1280, "height": 900},
-            locale="zh-CN",
-        )
-        self._context.set_default_navigation_timeout(
-            self._settings.nav_timeout_ms
-        )
-        self._context.set_default_timeout(self._settings.action_timeout_ms)
+        # Serialized with close(): if a cancellation already tore this
+        # session down, starting must fail instead of leaking a browser.
+        async with self._close_lock:
+            if self._closed:
+                raise JobCancelled("session closed before it could start")
+            self._playwright = await async_playwright().start()
+            # A dedicated browser process per job: full process-level
+            # isolation between parallel jobs in addition to context-level
+            # isolation.
+            self._browser = await self._playwright.chromium.launch(
+                headless=self._settings.headless,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-background-networking",
+                ],
+            )
+            self._context = await self._browser.new_context(
+                accept_downloads=True,
+                viewport={"width": 1280, "height": 900},
+                locale="zh-CN",
+            )
+            self._context.set_default_navigation_timeout(
+                self._settings.nav_timeout_ms
+            )
+            self._context.set_default_timeout(self._settings.action_timeout_ms)
 
-        # Context-level listener covers downloads initiated from the main
-        # page.  In some Chromium/Playwright builds a download started by a
-        # popup window (window.open -> timed redirect -> attachment) is only
-        # dispatched on that popup Page object, so every spawned page also
-        # gets its own listener in _on_page().  The first event wins.
-        self._context.on("download", self._on_download)
-        self._context.on("page", self._on_page)
+            # Context-level listener covers downloads initiated from the main
+            # page.  In some Chromium/Playwright builds a download started by
+            # a popup window (window.open -> timed redirect -> attachment) is
+            # only dispatched on that popup Page object, so every spawned
+            # page also gets its own listener in _on_page().  The first event
+            # wins.
+            self._context.on("download", self._on_download)
+            self._context.on("page", self._on_page)
 
-        self._page = await self._context.new_page()
+            self._page = await self._context.new_page()
 
     def _on_download(self, download: Download) -> None:
         # Only the first download of this isolated session is relevant.
@@ -139,26 +152,51 @@ class BrowserSession:
         return self._page
 
     async def close(self) -> None:
-        """Tear down pages, context, browser process and playwright driver."""
-        if self._closed:
-            return
-        self._closed = True
-        for page in list(self._spawned_pages):
-            with contextlib.suppress(Exception):
-                await page.close()
-        self._spawned_pages.clear()
-        if self._context is not None:
-            with contextlib.suppress(Exception):
-                await self._context.close()
-        if self._browser is not None:
-            with contextlib.suppress(Exception):
-                await self._browser.close()
-        if self._playwright is not None:
-            with contextlib.suppress(Exception):
-                await self._playwright.stop()
-        self._context = None
-        self._browser = None
-        self._playwright = None
+        """Tear down downloads, windows, context, browser process and driver.
+
+        Idempotent and join-able: a repeated call while a teardown is still
+        in progress waits for that same reclamation to finish; a call after
+        completion returns immediately.  Every step is best-effort so one
+        stuck resource never blocks the others.
+        """
+        async with self._close_lock:
+            if self._closed:
+                return
+            try:
+                # Stop an in-flight download first so nothing keeps writing
+                # into the staging directory while it is reclaimed.
+                if self._download is not None:
+                    with contextlib.suppress(Exception):
+                        await self._download.cancel()
+                # Close every popup window spawned by the export click, then
+                # the main page.
+                for page in list(self._spawned_pages):
+                    with contextlib.suppress(Exception):
+                        await page.close()
+                self._spawned_pages.clear()
+                if self._page is not None:
+                    with contextlib.suppress(Exception):
+                        await self._page.close()
+                # Demo hook (BROWSER_CLOSE_DELAY_SECONDS): emulate a slow
+                # reclamation of the browsing session so the job's
+                # finalizing phase becomes observable and interruptible.
+                if self._settings.close_delay_seconds > 0:
+                    await asyncio.sleep(self._settings.close_delay_seconds)
+                if self._context is not None:
+                    with contextlib.suppress(Exception):
+                        await self._context.close()
+                if self._browser is not None:
+                    with contextlib.suppress(Exception):
+                        await self._browser.close()
+                if self._playwright is not None:
+                    with contextlib.suppress(Exception):
+                        await self._playwright.stop()
+            finally:
+                self._closed = True
+                self._page = None
+                self._context = None
+                self._browser = None
+                self._playwright = None
 
     async def collect(self, station: str, month: str) -> Path:
         """Drive the portal and save the CSV into the staging directory."""

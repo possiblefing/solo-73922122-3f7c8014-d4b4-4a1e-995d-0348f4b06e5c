@@ -25,6 +25,8 @@ from collector.browser import (  # noqa: E402
 from collector.config import Settings  # noqa: E402
 from collector.main import app, manager  # noqa: E402
 
+TERMINAL = ("succeeded", "failed", "cancelled", "timeout")
+
 
 def csv_payload(station: str, month: str, rows: int = 3,
                 bad_station: bool = False) -> bytes:
@@ -41,26 +43,27 @@ def csv_payload(station: str, month: str, rows: int = 3,
 
 
 class FakeSession:
-    """Simulates BrowserSession: honours cancel events and a delay."""
+    """Simulates BrowserSession: honours cancel events, a collection delay
+    and a slow teardown.  close() mirrors the real join-able contract:
+    concurrent callers wait for the same single reclamation."""
 
-    def __init__(self, settings, staging_dir, cancel_event, deadline,
-                 payload: bytes | None = None, delay: float = 0.0,
-                 fail: Exception | None = None):
+    def __init__(self, settings, staging_dir, cancel_event, deadline):
         self.staging_dir = Path(staging_dir)
         self.cancel_event = cancel_event
         self.deadline = deadline
-        self._payload = payload
-        self._delay = delay
-        self._fail = fail
-        self.closed = False
         self.scenario_map: dict = {}
+        self.closed = False
+        self.close_calls = 0
+        self._close_lock = asyncio.Lock()
+        self._close_delay = 0.0
 
     async def start(self) -> None:
         return None
 
     async def collect(self, station: str, month: str) -> Path:
-        cfg = self.scenario_map.get(station)
-        delay = cfg.get("delay", 0.0) if cfg else 0.0
+        cfg = self.scenario_map.get(station) or {}
+        self._close_delay = cfg.get("close_delay", 0.0)
+        delay = cfg.get("delay", 0.0)
         # Cooperative wait that returns immediately on cancel.
         try:
             await asyncio.wait_for(self.cancel_event.wait(),
@@ -69,14 +72,21 @@ class FakeSession:
             pass
         if self.cancel_event.is_set():
             raise JobCancelled("cancelled in fake session")
-        if cfg and cfg.get("fail") is not None:
+        if cfg.get("fail") is not None:
             raise cfg["fail"]
-        payload = cfg["payload"] if cfg else csv_payload(station, month)
+        payload = cfg.get("payload") or csv_payload(station, month)
         target = self.staging_dir / f"aq_{station}_{month}.csv"
         target.write_bytes(payload)
         return target
+
     async def close(self) -> None:
-        self.closed = True
+        async with self._close_lock:
+            if self.closed:
+                return
+            self.close_calls += 1
+            if self._close_delay:
+                await asyncio.sleep(self._close_delay)
+            self.closed = True
 
 
 def patch_session(monkeypatch_payloads):
@@ -86,16 +96,23 @@ def patch_session(monkeypatch_payloads):
         # The staging directory name embeds the job id; station-specific
         # behaviour is selected via the module-level scenario map keyed by
         # the submit-time station, which the manager passes to collect().
-        session = FakeSession(
-            settings, staging_dir, cancel_event, deadline,
-            payload=None, delay=0.0, fail=None,
-        )
+        session = FakeSession(settings, staging_dir, cancel_event, deadline)
         session.scenario_map = monkeypatch_payloads
         sessions.append(session)
         return session
 
     manager_mod.build_session = fake_build
     return sessions
+
+
+async def wait_terminal(client: httpx.AsyncClient, job_id: str,
+                        tries: int = 100, interval: float = 0.05) -> dict:
+    for _ in range(tries):
+        body = (await client.get(f"/collect/jobs/{job_id}")).json()
+        if body["status"] in TERMINAL:
+            return body
+        await asyncio.sleep(interval)
+    raise AssertionError(f"job {job_id} did not reach a terminal state")
 
 
 async def main() -> int:
@@ -110,6 +127,10 @@ async def main() -> int:
         "STFAIL": {"fail": CollectionError("portal rejected query: boom")},
         "STSLOW": {"delay": 30.0, "payload": csv_payload("STSLOW",
                                                          "2026-10")},
+        # Slow teardown: the finalizing phase stays observable for a while.
+        "STSLOWCLOSE": {"close_delay": 1.0},
+        "STCANCELFIN": {"close_delay": 2.0},
+        "STFINLATE": {"close_delay": 2.0},
     })
 
     transport = httpx.ASGITransport(app=app)
@@ -121,17 +142,12 @@ async def main() -> int:
         assert r.status_code == 202, r.text
         job_id = r.json()["job_id"]
 
-        for _ in range(50):
-            r = await client.get(f"/collect/jobs/{job_id}")
-            if r.json()["status"] in (
-                "succeeded", "failed", "cancelled", "timeout"
-            ):
-                break
-            await asyncio.sleep(0.05)
-        body = r.json()
+        body = await wait_terminal(client, job_id)
         assert body["status"] == "succeeded", body
         assert body["rows"] == 3 and body["bytes"] > 0
+        assert body["finished_at"] is not None, body
         print("  ok  happy path succeeded:", body["download_url"])
+        print("  ok  finished_at filled on success:", body["finished_at"])
 
         r = await client.get(body["download_url"])
         assert r.status_code == 200 and b"ST001" in r.content
@@ -149,13 +165,9 @@ async def main() -> int:
         r = await client.post("/collect/jobs",
                               json={"station": "STBAD", "month": "2026-10"})
         jid = r.json()["job_id"]
-        for _ in range(50):
-            rb = (await client.get(f"/collect/jobs/{jid}")).json()
-            if rb["status"] in ("succeeded", "failed", "cancelled",
-                                "timeout"):
-                break
-            await asyncio.sleep(0.05)
+        rb = await wait_terminal(client, jid)
         assert rb["status"] == "failed" and "validation" in rb["error"], rb
+        assert rb["finished_at"] is not None
         r = await client.get(f"/collect/jobs/{jid}/download")
         assert r.status_code == 409
         assert not (work / jid).exists()
@@ -166,11 +178,7 @@ async def main() -> int:
         r = await client.post("/collect/jobs",
                               json={"station": "STFAIL", "month": "2026-10"})
         jid = r.json()["job_id"]
-        for _ in range(50):
-            rb = (await client.get(f"/collect/jobs/{jid}")).json()
-            if rb["status"] != "running" and rb["status"] != "pending":
-                break
-            await asyncio.sleep(0.05)
+        rb = await wait_terminal(client, jid)
         assert rb["status"] == "failed" and "boom" in rb["error"], rb
         assert not (work / f"{jid}.staging").exists()
         print("  ok  collection error -> failed with cleanup")
@@ -183,12 +191,7 @@ async def main() -> int:
         r = await client.post(f"/collect/jobs/{jid}/cancel")
         assert r.status_code == 200, r.text
         assert r.json()["status"] == "cancelling"
-        for _ in range(80):
-            rb = (await client.get(f"/collect/jobs/{jid}")).json()
-            if rb["status"] in ("succeeded", "failed", "cancelled",
-                                "timeout"):
-                break
-            await asyncio.sleep(0.05)
+        rb = await wait_terminal(client, jid)
         assert rb["status"] == "cancelled", rb
         assert rb["finished_at"] is not None
         r = await client.get(f"/collect/jobs/{jid}/download")
@@ -201,10 +204,137 @@ async def main() -> int:
         assert r.status_code == 409
         print("  ok  second cancel -> 409")
 
-        # 60s-style budget timeout, compressed to 1 second -------------------
-        print("\n[timeout] short acceptance budget must end in 'timeout'")
+        # slow teardown: success is reported only after reclamation ---------
+        print("\n[slow close] terminal state waits for reclamation")
+        r = await client.post(
+            "/collect/jobs",
+            json={"station": "STSLOWCLOSE", "month": "2026-10"},
+        )
+        jid = r.json()["job_id"]
+        session = sessions[-1]
+        saw_finalizing = False
+        for _ in range(200):
+            rb = (await client.get(f"/collect/jobs/{jid}")).json()
+            if rb["status"] == "finalizing":
+                saw_finalizing = True
+                # Not yet terminal: no finished_at, no download link, and
+                # the file is not served while reclamation runs.
+                assert rb["finished_at"] is None, rb
+                assert rb["download_url"] is None, rb
+                r2 = await client.get(f"/collect/jobs/{jid}/download")
+                assert r2.status_code == 409, r2.status_code
+            if rb["status"] in TERMINAL:
+                break
+            await asyncio.sleep(0.03)
+        assert saw_finalizing, "finalizing phase was never observed"
+        assert rb["status"] == "succeeded", rb
+        assert rb["finished_at"] is not None, rb
+        # Reclamation completed before the terminal state was reported.
+        assert session.closed and session.close_calls == 1
+        r = await client.get(rb["download_url"])
+        assert r.status_code == 200 and b"STSLOWCLOSE" in r.content
+        print("  ok  succeeded only after close; download opened at terminal")
+
+        # slow teardown: cancel is still accepted while finalizing ----------
+        print("\n[slow close] cancel during finalization")
+        r = await client.post(
+            "/collect/jobs",
+            json={"station": "STCANCELFIN", "month": "2026-10"},
+        )
+        jid = r.json()["job_id"]
+        session = sessions[-1]
+        for _ in range(200):
+            rb = (await client.get(f"/collect/jobs/{jid}")).json()
+            if rb["status"] == "finalizing":
+                break
+            assert rb["status"] not in TERMINAL, rb
+            await asyncio.sleep(0.03)
+        else:
+            raise AssertionError("job never reached finalizing")
+        r = await client.post(f"/collect/jobs/{jid}/cancel")
+        assert r.status_code == 200, r.text
+        assert r.json()["status"] == "cancelling"
+        rb = await wait_terminal(client, jid, tries=200)
+        # Cancel and success interleaved: exactly one outcome, and the
+        # accepted cancellation wins - the file must not be published.
+        assert rb["status"] == "cancelled", rb
+        assert rb["finished_at"] is not None
+        assert rb["download_url"] is None
+        r = await client.get(f"/collect/jobs/{jid}/download")
+        assert r.status_code == 409
+        assert not (work / jid).exists()
+        assert not (work / f"{jid}.staging").exists()
+        # The cancel-triggered close and the worker's close joined the same
+        # single reclamation instead of tearing down twice.
+        assert session.closed and session.close_calls == 1, session.close_calls
+        print("  ok  cancel during finalizing -> cancelled, no file, "
+              "single joined reclamation")
+
+        # deadline expires during finalization ------------------------------
+        print("\n[slow close] acceptance deadline arrives while finalizing")
         from collector.main import manager as app_manager
 
+        fast_dir = tempfile.mkdtemp(prefix="aq-fast-")
+        original_settings = app_manager._settings
+        app_manager._settings = Settings(
+            work_dir=fast_dir,
+            job_timeout_seconds=1.0,   # budget ends mid-teardown
+            cleanup_timeout_seconds=5,
+        )
+        try:
+            r = await client.post(
+                "/collect/jobs",
+                json={"station": "STFINLATE", "month": "2026-10"},
+            )
+            jid = r.json()["job_id"]
+            session = sessions[-1]
+            rb = await wait_terminal(client, jid, tries=200)
+            # Reclamation was NOT skipped (close ran to completion) and the
+            # would-be success download was NOT retained.
+            assert rb["status"] == "timeout", rb
+            assert rb["finished_at"] is not None
+            assert session.closed, "teardown was skipped on deadline"
+            r = await client.get(f"/collect/jobs/{jid}/download")
+            assert r.status_code == 409
+            assert not (Path(fast_dir) / jid).exists()
+            assert not (Path(fast_dir) / f"{jid}.staging").exists()
+            print("  ok  deadline during finalizing -> timeout, teardown "
+                  "completed, no download retained")
+        finally:
+            app_manager._settings = original_settings
+
+        # cancel/success interleave: exactly one consistent outcome ---------
+        print("\n[race] cancel vs success settles exactly one outcome")
+        import random
+
+        rng = random.Random(20261113)
+        outcomes = {"succeeded": 0, "cancelled": 0}
+        for i in range(12):
+            r = await client.post(
+                "/collect/jobs",
+                json={"station": "ST001", "month": "2026-10"},
+            )
+            jid = r.json()["job_id"]
+            # Cancel at a random moment around the settle boundary.
+            await asyncio.sleep(rng.random() * 0.08)
+            await client.post(f"/collect/jobs/{jid}/cancel")
+            rb = await wait_terminal(client, jid)
+            assert rb["status"] in ("succeeded", "cancelled"), rb
+            assert rb["finished_at"] is not None
+            outcomes[rb["status"]] += 1
+            r = await client.get(f"/collect/jobs/{jid}/download")
+            if rb["status"] == "cancelled":
+                # An accepted cancellation never leaves a published file.
+                assert r.status_code == 409
+                assert not (work / jid).exists()
+            else:
+                assert r.status_code == 200
+                assert (work / jid).is_dir()
+            assert not (work / f"{jid}.staging").exists()
+        print(f"  ok  12 interleaved runs settled consistently: {outcomes}")
+
+        # 60s-style budget timeout, compressed to 1 second -------------------
+        print("\n[timeout] short acceptance budget must end in 'timeout'")
         original_settings = app_manager._settings
         app_manager._settings = Settings(
             work_dir=tempfile.mkdtemp(prefix="aq-fast-"),
@@ -217,12 +347,7 @@ async def main() -> int:
                 json={"station": "STSLOW", "month": "2026-10"},
             )
             jid = r.json()["job_id"]
-            for _ in range(80):
-                rb = (await client.get(f"/collect/jobs/{jid}")).json()
-                if rb["status"] in ("succeeded", "failed", "cancelled",
-                                    "timeout"):
-                    break
-                await asyncio.sleep(0.05)
+            rb = await wait_terminal(client, jid)
             assert rb["status"] == "timeout", rb
             assert rb["finished_at"] is not None
             r = await client.get(f"/collect/jobs/{jid}/download")

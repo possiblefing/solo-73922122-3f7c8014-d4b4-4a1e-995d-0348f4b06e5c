@@ -29,6 +29,13 @@ class Settings:
     cleanup_timeout_seconds: float = float(
         os.environ.get("CLEANUP_TIMEOUT_SECONDS", "15")
     )
+    # Demo hook: artificial delay inside browser teardown (after popup
+    # windows and downloads are reclaimed, before the context/browser
+    # process/driver are released).  Makes the finalizing phase observable
+    # and interruptible.  0 in production.
+    close_delay_seconds: float = float(
+        os.environ.get("BROWSER_CLOSE_DELAY_SECONDS", "0")
+    )
     work_dir: str = os.environ.get("WORK_DIR", "/tmp/aq-jobs")
     headless: bool = os.environ.get("HEADLESS", "true").lower() in (
         "1",

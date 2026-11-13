@@ -34,10 +34,12 @@ app = FastAPI(
     title="空气质量月度读数采集 API",
     description=(
         "通过真实浏览器（Playwright）操作旧监测门户，选站、查询并点击"
-        "导出 CSV。任务之间浏览器会话、窗口与下载完全隔离；仅当文件"
-        "完整下载且每行站号、UTC 月份校验通过后才开放下载。"
+        "导出 CSV。任务之间浏览器会话、窗口与下载完全隔离；文件完整下载"
+        "且每行站号、UTC 月份校验通过后进入收尾（finalizing）：浏览器、"
+        "窗口、下载与暂存目录全部回收后，才报告终态并填写 finished_at，"
+        "成功文件此时才开放下载。收尾期间仍可取消，已受理取消不会发布文件。"
     ),
-    version="1.0.0",
+    version="1.1.0",
 )
 manager = JobManager(settings)
 
@@ -127,7 +129,7 @@ async def job_status(job_id: str) -> JobStatusResponse:
     "/collect/jobs/{job_id}/cancel",
     response_model=CancelResponse,
     tags=["jobs"],
-    summary="取消任务",
+    summary="取消任务（运行中与收尾中均可受理）",
 )
 async def cancel_job(job_id: str) -> CancelResponse:
     accepted, message = await manager.request_cancel(job_id)
@@ -148,7 +150,7 @@ async def cancel_job(job_id: str) -> CancelResponse:
 @app.get(
     "/collect/jobs/{job_id}/download",
     tags=["jobs"],
-    summary="下载已校验的 CSV（仅成功任务可用）",
+    summary="下载已校验的 CSV（仅终态 succeeded 任务可用）",
 )
 async def download_job(job_id: str) -> FileResponse:
     record = manager.get(job_id)

@@ -40,7 +40,9 @@ curl -s -X POST http://localhost:8000/collect/jobs \
 curl -s http://localhost:8000/collect/jobs/<JOB_ID> | python -m json.tool
 ```
 
-成功后响应包含行数、字节数与下载链接：
+任务先经过 `running`，采集完成后进入 `finalizing`（浏览器、窗口、下载
+与暂存目录回收中；标准环境下该阶段很短）。回收全部完成后才报告终态
+`succeeded` 并填写 `finished_at`，此时响应才包含行数、字节数与下载链接：
 
 ```json
 {
@@ -51,9 +53,13 @@ curl -s http://localhost:8000/collect/jobs/<JOB_ID> | python -m json.tool
   "rows": 24,
   "bytes": 820,
   "deadline_at": "2026-11-13T07:25:29.000+00:00",
+  "finished_at": "2026-11-13T07:24:41.000+00:00",
   "download_url": "/collect/jobs/<JOB_ID>/download"
 }
 ```
+
+> 注意：`finalizing` 期间 `finished_at` 与 `download_url` 均为 `null`，
+> 下载接口返回 `409`——成功文件只在终态报告后才可下载。
 
 列出全部任务：
 
@@ -154,7 +160,72 @@ curl -s -X POST http://localhost:8000/collect/jobs \
 {"status":"timeout","error":"job exceeded 60s acceptance budget"}
 ```
 
-## 7. 输入校验
+## 7. 慢关闭（收尾阶段）演示
+
+以上取消/超时演示针对**采集进行中**。慢关闭覆盖层则把浏览器回收人为
+放慢 15 秒（`BROWSER_CLOSE_DELAY_SECONDS`，门户保持快速），让
+`finalizing` 收尾阶段可观察、可打断：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.slowclose.yml up --build
+```
+
+### 7a. 成功只在回收完成后报告
+
+```bash
+JID=$(curl -s -X POST http://localhost:8000/collect/jobs \
+  -H 'Content-Type: application/json' \
+  -d '{"station":"ST005","month":"2026-10"}' | python -c 'import sys,json;print(json.load(sys.stdin)["job_id"])')
+
+# 采集约 7 秒完成，随后进入约 15 秒的 finalizing：
+watch -n1 curl -s http://localhost:8000/collect/jobs/$JID
+```
+
+`finalizing` 期间：
+
+```json
+{"status":"finalizing","finished_at":null,"download_url":null}
+```
+
+此时下载返回 `409`。约 15 秒后回收完成，才报告终态并开放下载：
+
+```json
+{"status":"succeeded","finished_at":"...","download_url":"/collect/jobs/.../download"}
+```
+
+### 7b. 收尾期间仍可取消
+
+同样用慢关闭环境。受理任务并轮询，一旦看到 `finalizing` 立即取消：
+
+```bash
+JID=$(curl -s -X POST http://localhost:8000/collect/jobs \
+  -H 'Content-Type: application/json' \
+  -d '{"station":"ST001","month":"2026-11"}' | python -c 'import sys,json;print(json.load(sys.stdin)["job_id"])')
+# 约 8 秒后任务进入 finalizing（也可先轮询确认）
+sleep 9
+curl -s -X POST http://localhost:8000/collect/jobs/$JID/cancel | python -m json.tool
+```
+
+取消被受理（`cancelling`），回收完成后落定 `cancelled`：文件**不会**
+发布，下载返回 `409`。取消与成功在状态锁内原子裁定，只落定一种结果。
+
+### 7c. 60 秒期限在收尾中到达
+
+把受理预算压到收尾窗口内启动同一覆盖层（采集约 7 秒 + 慢关闭 15 秒，
+预算 14 秒会在收尾期间到期）：
+
+```bash
+JOB_TIMEOUT_SECONDS=14 docker compose -f docker-compose.yml -f docker-compose.slowclose.yml up --build
+```
+
+受理任务并轮询：文件虽已下载并通过校验，但期限在收尾中到达——回收
+**不会**被跳过，任务落定 `timeout`，成功下载**不被保留**（`409`）：
+
+```json
+{"status":"timeout","finished_at":"...","error":"acceptance budget reached during finalization; download discarded"}
+```
+
+## 8. 输入校验
 
 错误的月份格式在入口处被 Pydantic 拒绝（422），不会创建任务：
 
@@ -170,6 +241,12 @@ curl -i -X POST http://localhost:8000/collect/jobs \
 # 标准门户：并行成功、坏数据、未知站、404/422
 python -I tests/e2e_demo.py http://localhost:8000
 
-# 慢门户：追加取消与超时用例
+# 慢门户：追加运行中取消与 60s 超时用例
 SLOW=1 python -I tests/e2e_demo.py http://localhost:8000
+
+# 慢关闭：追加“成功只在回收后报告”与“收尾中取消”用例
+SLOWCLOSE=1 python -I tests/e2e_demo.py http://localhost:8000
+
+# 慢关闭 + 压缩预算（JOB_TIMEOUT_SECONDS=14 启动）：期限在收尾中到达
+SLOWCLOSE_TIMEOUT=1 python -I tests/e2e_demo.py http://localhost:8000
 ```

@@ -2,18 +2,31 @@
 
 Lifecycle:
 
-    pending -> running -> succeeded
-        |              |-> failed
-        |              |-> cancelling -> cancelled   (cancel accepted first;
-        |              |                  terminal only after teardown)
-        |              |-> timeout
-        -> cancelling -> cancelled                   (cancel while queued)
+    pending -> running -> finalizing -> succeeded
+        |         |           |     |-> failed
+        |         |           |     |-> cancelled
+        |         |           |     |-> timeout
+        |         |           |-> cancelling -> (finalizing) -> cancelled
+        |         |-> cancelling
+        |-> cancelling
+
+    "finalizing" is the teardown phase: collection has finished and the
+    browser session (popup windows, in-flight downloads, context, browser
+    process, driver) plus the staging directory are being reclaimed.  A
+    terminal state and finished_at are only published after that
+    reclamation completes; a successful file becomes downloadable only at
+    that moment.  Cancellation is still accepted while finalizing.
 
 Guarantees implemented here:
   * every job has a private work directory (staging) and its own browser;
-  * a download is only atomically published after full validation;
+  * a download is only atomically published after full validation, and only
+    becomes visible together with the terminal "succeeded" state;
   * once cancel is accepted, a late download can never be published;
-  * the same applies when the deadline fires;
+  * the same applies when the acceptance deadline fires - even if it fires
+    while finalization is already in progress (reclamation is never
+    skipped and a would-be success download is never retained);
+  * cancellation and success may interleave, but exactly one outcome is
+    settled, decided atomically under the per-job state lock;
   * terminal status is only reported after browser resources and the
     staging directory have been reclaimed.
 """
@@ -37,7 +50,7 @@ from .browser import (
     build_session,
 )
 from .config import Settings
-from .validation import ValidationError, validate_csv
+from .validation import ValidationError, ValidationResult, validate_csv
 
 TERMINAL_STATES = frozenset(
     {"succeeded", "failed", "cancelled", "timeout"}
@@ -67,6 +80,10 @@ class JobRecord:
     state_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     session: BrowserSession | None = None
     task: asyncio.Task | None = None
+    # Validated artifact still sitting in the private staging directory,
+    # waiting for the finalization phase to publish or discard it.
+    staging_file: Path | None = None
+    validation: ValidationResult | None = None
 
     def is_terminal(self) -> bool:
         return self.status in TERMINAL_STATES
@@ -88,8 +105,17 @@ class JobManager:
         async with self._registry_lock:
             records = list(self._jobs.values())
         for record in records:
-            if not record.is_terminal():
+            async with record.state_lock:
+                if record.is_terminal():
+                    continue
+                # Shutdown is a cancellation: the settle step will report
+                # the terminal state only after teardown completes.
+                record.status = "cancelling"
                 record.cancel_event.set()
+            if record.session is not None:
+                # Proactively interrupt slow browser waits; the worker
+                # joins this same reclamation via the session close lock.
+                asyncio.create_task(record.session.close())
         pending = [
             r.task for r in records if r.task and not r.task.done()
         ]
@@ -131,8 +157,9 @@ class JobManager:
     async def request_cancel(self, job_id: str) -> tuple[bool, str]:
         """Accept cancellation for any non-terminal job.
 
-        Returns (accepted, message).  Once accepted, publishing is blocked
-        even if the download arrives moments later.
+        Returns (accepted, message).  Cancellation is still accepted while
+        the job is finalizing; once accepted, publishing is blocked even
+        if the download arrives moments later.
         """
         record = self._jobs.get(job_id)
         if record is None:
@@ -140,12 +167,15 @@ class JobManager:
         async with record.state_lock:
             if record.is_terminal():
                 return False, f"job already terminal: {record.status}"
-            # Non-terminal visible state until teardown completes; the worker
-            # flips this to the terminal "cancelled" only after cleanup.
+            # Non-terminal visible state until teardown completes; the
+            # settle step flips this to the terminal "cancelled" only
+            # after cleanup.
             record.status = "cancelling"
             record.error = "cancellation accepted; tearing down browser work"
-        # Signal first, then proactively tear the browser down so waiting on
-        # a slow popup/download is interrupted immediately.
+        # Signal first, then proactively tear the browser down so waiting
+        # on a slow popup/download is interrupted immediately.  The worker
+        # joins this very same reclamation via the session's close lock -
+        # it is never executed twice.
         record.cancel_event.set()
         if record.session is not None:
             asyncio.create_task(record.session.close())
@@ -158,34 +188,63 @@ class JobManager:
     async def _run(self, record: JobRecord) -> None:
         budget = self._settings.job_timeout_seconds
         deadline = Deadline(budget, record.cancel_event)
+        proposed: str
+        message: str | None
         try:
+            # Phase 1 (collection) is bounded by the acceptance budget.
+            # Phase 2 (finalization/teardown) deliberately runs outside
+            # this timeout: a deadline expiring during teardown must never
+            # skip the reclamation.
             async with asyncio.timeout(budget):
-                await self._work(record, deadline)
-        except (asyncio.CancelledError, JobCancelled):
-            await self._finish(record, "cancelled",
-                               "cancelled by client before completion")
+                proposed, message = await self._collect(record, deadline)
+        except (asyncio.CancelledError, JobCancelled) as exc:
+            proposed = "cancelled"
+            message = str(exc) or "cancelled by client before completion"
         except TimeoutError:  # asyncio.timeout() budget exhausted
             record.cancel_event.set()
-            await self._finish(
-                record, "timeout",
-                f"job exceeded {budget:.0f}s acceptance budget",
-            )
+            proposed = "timeout"
+            message = f"job exceeded {budget:.0f}s acceptance budget"
         except JobDeadlineExceeded as exc:
             record.cancel_event.set()
-            await self._finish(record, "timeout", str(exc))
+            proposed = "timeout"
+            message = str(exc)
         except CollectionError as exc:
-            await self._finish(record, "failed", str(exc))
+            proposed = "failed"
+            message = str(exc)
         except ValidationError as exc:
-            await self._finish(
-                record, "failed", f"csv validation failed: {exc}"
-            )
+            proposed = "failed"
+            message = f"csv validation failed: {exc}"
         except Exception as exc:  # defensive: never leave a job dangling
-            await self._finish(
-                record, "failed",
-                f"unexpected error: {type(exc).__name__}: {exc}",
-            )
+            proposed = "failed"
+            message = f"unexpected error: {type(exc).__name__}: {exc}"
 
-    async def _work(self, record: JobRecord, deadline: Deadline) -> None:
+        try:
+            await self._finalize(record, proposed, message, deadline)
+        except asyncio.CancelledError:
+            async with record.state_lock:
+                if not record.is_terminal():
+                    record.status = "cancelled"
+                    record.error = "worker cancelled during finalization"
+                    record.finished_at = _utcnow_iso()
+            raise
+        except Exception as exc:  # last resort: never stay non-terminal
+            async with record.state_lock:
+                if not record.is_terminal():
+                    record.status = "failed"
+                    record.error = (
+                        f"finalization error: {type(exc).__name__}: {exc}"
+                    )
+                    record.finished_at = _utcnow_iso()
+
+    async def _collect(
+        self, record: JobRecord, deadline: Deadline
+    ) -> tuple[str, str | None]:
+        """Drive the browser and validate the download.
+
+        Returns the proposed outcome.  Nothing is published here and no
+        terminal state is reported: the validated file stays in the
+        private staging directory until finalization completes.
+        """
         async with record.state_lock:
             if record.status == "cancelling" or record.is_terminal():
                 # Cancel landed while the task was still queued.
@@ -200,71 +259,46 @@ class JobManager:
             deadline,
         )
         record.session = session
-        try:
-            await session.start()
-            staging_path = await session.collect(
-                record.station, record.month
-            )
 
-            # Publish gate: a cancel accepted at any point before validation
-            # completes blocks publication; the late download is discarded.
-            if record.cancel_event.is_set():
-                raise JobCancelled(
-                    "cancellation accepted; download not published"
-                )
-            deadline.check()
+        await session.start()
+        staging_path = await session.collect(record.station, record.month)
 
-            payload = await asyncio.to_thread(staging_path.read_bytes)
-            result = await asyncio.to_thread(
-                validate_csv, payload, record.station, record.month
-            )
+        # Publish gate: a cancel accepted at any point before validation
+        # completes blocks publication; the late download is discarded.
+        deadline.check()
 
-            if record.cancel_event.is_set():
-                raise JobCancelled(
-                    "cancellation accepted; download not published"
-                )
-            deadline.check()
+        payload = await asyncio.to_thread(staging_path.read_bytes)
+        result = await asyncio.to_thread(
+            validate_csv, payload, record.station, record.month
+        )
 
-            published_dir = (
-                Path(self._settings.work_dir) / record.job_id
-            )
-            published_dir.mkdir(parents=True, exist_ok=True)
-            published_path = published_dir / staging_path.name
-            # Atomic move on the same volume: readers never see a partial file.
-            await asyncio.to_thread(
-                shutil.move, str(staging_path), str(published_path)
-            )
+        deadline.check()
 
-            async with record.state_lock:
-                if record.cancel_event.is_set() or deadline.expired():
-                    # Cancel/deadline landed in the tiny window around the
-                    # move: remove the artifact so it can never be served.
-                    await asyncio.to_thread(
-                        shutil.rmtree, published_dir, True
-                    )
-                    if record.cancel_event.is_set():
-                        raise JobCancelled(
-                            "cancelled after publication attempt"
-                        )
-                    raise JobDeadlineExceeded(
-                        "deadline exceeded during publish"
-                    )
-                record.download_path = published_path
-                record.size_bytes = result.size_bytes
-                record.rows = result.rows
-                record.status = "succeeded"
-        finally:
-            # Browser teardown happens for every outcome, before terminal
-            # state is reported.
-            await session.close()
-            record.session = None
+        record.staging_file = staging_path
+        record.validation = result
+        return "succeeded", None
 
-        # Success path: reclaim the (now empty) staging directory.
-        await self._cleanup_staging(record)
+    async def _finalize(
+        self,
+        record: JobRecord,
+        proposed: str,
+        message: str | None,
+        deadline: Deadline,
+    ) -> None:
+        """Reclaim every resource, then settle exactly one terminal state.
 
-    async def _finish(self, record: JobRecord, status: str,
-                      message: str) -> None:
-        """Terminal transition performed only after full teardown."""
+        Runs outside the acceptance budget: even if the 60s deadline
+        arrives while this phase is in progress, reclamation is carried
+        out to completion and a would-be success download is discarded.
+        """
+        async with record.state_lock:
+            if record.status != "cancelling":
+                record.status = "finalizing"
+
+        # 1. Reclaim the browser session: in-flight download, popup
+        #    windows, main page, context, browser process and driver.  A
+        #    close already triggered by request_cancel is joined via the
+        #    session's close lock, never duplicated.
         if record.session is not None:
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(
@@ -272,21 +306,67 @@ class JobManager:
                     timeout=self._settings.cleanup_timeout_seconds,
                 )
             record.session = None
+
+        # 2. Publish the validated artifact - unless a cancel/deadline
+        #    already landed, in which case the staging file is discarded
+        #    with the staging directory below.
+        published_path: Path | None = None
+        if (
+            proposed == "succeeded"
+            and record.staging_file is not None
+            and not record.cancel_event.is_set()
+            and not deadline.expired()
+        ):
+            published_dir = Path(self._settings.work_dir) / record.job_id
+            published_dir.mkdir(parents=True, exist_ok=True)
+            published_path = published_dir / record.staging_file.name
+            # Atomic move on the same volume: readers never see a partial
+            # file.  Still not servable: status is not terminal yet.
+            await asyncio.to_thread(
+                shutil.move, str(record.staging_file), str(published_path)
+            )
+
+        # 3. Reclaim the private staging directory (now empty, or still
+        #    holding a download that must never be published).
         await self._cleanup_staging(record)
+
+        # 4. Settle exactly one outcome, atomically with request_cancel.
         async with record.state_lock:
-            if not record.is_terminal():
-                # "cancelling" settles to the terminal "cancelled" here,
-                # only after every browser resource and staging artifact
-                # has been reclaimed.
-                if record.status == "cancelling":
-                    record.status = "cancelled"
-                    record.error = (
-                        "cancelled by client; browser work and downloads "
-                        "reclaimed"
+            if record.status == "cancelling":
+                # A cancellation accepted at any point before this moment
+                # wins over success/failure/timeout alike.
+                final = "cancelled"
+                final_message = (
+                    "cancelled by client; browser work and downloads "
+                    "reclaimed"
+                )
+            elif proposed == "succeeded" and deadline.expired():
+                # The acceptance budget ran out during finalization: the
+                # success download must not be retained.
+                final = "timeout"
+                final_message = (
+                    "acceptance budget reached during finalization; "
+                    "download discarded"
+                )
+            else:
+                final = proposed
+                final_message = message
+
+            if final == "succeeded" and published_path is not None:
+                assert record.validation is not None
+                record.download_path = published_path
+                record.size_bytes = record.validation.size_bytes
+                record.rows = record.validation.rows
+            else:
+                # Cancel/deadline interleaved with the publish move, or
+                # any non-success outcome: nothing may remain downloadable.
+                record.download_path = None
+                if published_path is not None:
+                    await asyncio.to_thread(
+                        shutil.rmtree, published_path.parent, True
                     )
-                else:
-                    record.status = status
-                    record.error = message
+            record.status = final
+            record.error = final_message
             record.finished_at = _utcnow_iso()
 
     async def _cleanup_staging(self, record: JobRecord) -> None:

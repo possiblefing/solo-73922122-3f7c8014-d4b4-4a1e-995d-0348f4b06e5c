@@ -9,11 +9,15 @@ from pydantic import BaseModel, Field, field_validator
 
 # Accepted-at-inception terminal/non-terminal job states.
 # "cancelling" means cancellation was accepted and browser/teardown work is
-# still in flight; the terminal "cancelled" is only reported after cleanup.
+# still in flight; "finalizing" means collection finished and the browser
+# session plus staging directory are being reclaimed.  Terminal states
+# (succeeded/failed/cancelled/timeout) are only reported, together with
+# finished_at, after that reclamation completes.
 JobStatus = Literal[
     "pending",
     "running",
     "cancelling",
+    "finalizing",
     "succeeded",
     "failed",
     "cancelled",

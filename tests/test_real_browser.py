@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -18,7 +19,38 @@ from collector.config import Settings  # noqa: E402
 from collector.validation import validate_csv  # noqa: E402
 
 
+async def test_join_close() -> None:
+    """A repeated close() must wait for the same in-progress reclamation
+    instead of returning early or tearing resources down twice."""
+    settings = Settings(close_delay_seconds=1.0)
+    cancel = asyncio.Event()
+    deadline = Deadline(60.0, cancel)
+    session = BrowserSession(
+        settings, cancel, deadline, Path(tempfile.mkdtemp(prefix="aq-join-"))
+    )
+    t0 = time.monotonic()
+    first = asyncio.create_task(session.close())
+    await asyncio.sleep(0.3)  # first close is now mid-teardown
+    second = asyncio.create_task(session.close())
+    await second
+    joined_after = time.monotonic() - t0
+    await first
+    total = time.monotonic() - t0
+    # The second call joined the same reclamation: it returned only when
+    # the first teardown finished (~1.0s) - not immediately (~0.3s) - and
+    # it did not run a second teardown (~1.3s+).
+    assert 0.55 < joined_after < 1.2, joined_after
+    assert total < 1.6, total
+    # A close after completion returns immediately.
+    t1 = time.monotonic()
+    await session.close()
+    assert time.monotonic() - t1 < 0.2
+    print("  ok  repeated close joins the same in-progress reclamation")
+
+
 async def main() -> int:
+    await test_join_close()
+
     work = Path(tempfile.mkdtemp(prefix="aq-py-pw-"))
     staging = work / "staging"
     staging.mkdir()
