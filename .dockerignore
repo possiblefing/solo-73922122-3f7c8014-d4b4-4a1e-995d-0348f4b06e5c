@@ -1,0 +1,13 @@
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+**/.venv/
+**/node_modules/
+.git/
+.gitignore
+docs/
+tests/
+*.staging/
+aq-jobs/
+docker-compose*.yml
+README.md

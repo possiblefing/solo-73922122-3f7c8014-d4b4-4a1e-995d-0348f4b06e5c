@@ -1,0 +1,11 @@
+# Slow-portal profile for demonstrating cancellation and the 60s timeout.
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.slow.yml up --build
+# Then submit a job and either:
+#   - POST .../cancel within the first few seconds (cancel demo), or
+#   - simply wait: the job hits its 60s acceptance budget (timeout demo).
+services:
+  portal:
+    environment:
+      PORTAL_POPUP_DELAY: "10"
+      PORTAL_DOWNLOAD_DELAY: "90"

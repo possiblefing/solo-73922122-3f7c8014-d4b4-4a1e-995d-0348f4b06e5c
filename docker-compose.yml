@@ -1,0 +1,44 @@
+services:
+  # Local mock of the legacy monitoring portal with fictional readings.
+  portal:
+    build:
+      context: ./portal
+    image: aq-legacy-portal:local
+    environment:
+      PORTAL_PORT: "8080"
+      # Delays make the popup/download behaviour observable; override with
+      # docker-compose -f docker-compose.yml -f docker-compose.slow.yml for
+      # cancellation/timeout demos.
+      PORTAL_POPUP_DELAY: "2"
+      PORTAL_DOWNLOAD_DELAY: "2"
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2); sys.exit(0)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  collector:
+    build:
+      context: .
+      dockerfile: collector/Dockerfile
+    image: aq-collector:local
+    depends_on:
+      portal:
+        condition: service_healthy
+    environment:
+      # Fixed portal address - never supplied per request.
+      PORTAL_URL: "http://portal:8080"
+      JOB_TIMEOUT_SECONDS: "60"
+      CLEANUP_TIMEOUT_SECONDS: "15"
+      WORK_DIR: "/tmp/aq-jobs"
+      HEADLESS: "true"
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2); sys.exit(0)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
